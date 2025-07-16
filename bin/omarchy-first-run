@@ -1,0 +1,7 @@
+#!/bin/bash
+
+if [[ ! -f ~/.local/state/omarchy/first-run.marker ]]; then
+  chromium --new-window --app=file://$HOME/.local/share/omarchy/first-run/index.html
+  mkdir -p ~/.local/state/omarchy
+  touch ~/.local/state/omarchy/first-run.marker
+fi
