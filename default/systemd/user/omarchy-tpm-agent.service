@@ -1,0 +1,27 @@
+[Unit]
+Description=Serve a TPM-sealed key for unattended Git commit signing
+Documentation=man:ssh-tpm-agent(1)
+# Both conditions keep the unit inert rather than failing: machines without a
+# TPM and users who never created a key run nothing at all.
+ConditionPathExists=/dev/tpmrm0
+ConditionPathExistsGlob=%h/.local/state/omarchy/tpm-signing/*.tpm
+Requires=omarchy-tpm-agent.socket
+# Without a limit the restart interval never trips the default burst, so a
+# broken agent would loop forever instead of surfacing as failed.
+StartLimitIntervalSec=5min
+StartLimitBurst=5
+
+[Service]
+# Type=exec so a binary that cannot be executed is reported as a failed start
+# rather than a successful fork.
+Type=exec
+# A key created with a PIN can only be used if the agent can ask for it, and a
+# background service never has a terminal to ask on.
+Environment=SSH_ASKPASS=/usr/bin/omarchy-ssh-askpass
+# The socket comes from systemd, so nothing here binds one. --key-dir confines
+# the agent to the key this command manages: pointed at the default ~/.ssh it
+# would load every sealed key the user owns, including a PIN-protected one, and
+# --no-cache makes sure a PIN it does meet is asked for every time.
+ExecStart=/usr/bin/ssh-tpm-agent --key-dir %h/.local/state/omarchy/tpm-signing --no-cache
+Restart=on-failure
+RestartSec=5

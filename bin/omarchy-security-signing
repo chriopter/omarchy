@@ -1,0 +1,546 @@
+#!/bin/bash
+
+# omarchy:summary=Sign Git commits with a key sealed in this machine's TPM
+# omarchy:args=[setup|status|wipe]
+# omarchy:examples=omarchy security signing | omarchy security signing status
+
+# A key created inside the TPM never exists as bytes on this host: the chip
+# signs and the file on disk is a sealed handle, useless on any other machine.
+# So an agent working while nobody is at the keyboard can sign commits without
+# a passphrase prompt, and a leaked file, backup or disk image is inert.
+#
+# What it does not do is say who asked. The signed object records no machine,
+# no time and no requesting process -- only that this key was used. Anything
+# running as this user can ask for a signature, and stopping the agent does not
+# prevent it: any process can start its own agent from the same sealed file.
+#
+# The key is never registered for authentication, because a passphraseless key
+# anything running as this user can reach must not also grant push access to
+# every repository. That is a registration policy, not a property of the key:
+# an SSH agent makes no distinction between signing and authenticating, so this
+# key would log in anywhere its public half reaches an authorized_keys.
+
+set -uo pipefail
+
+KEY_DIR="$HOME/.local/state/omarchy/tpm-signing"
+SEALED_KEY="$KEY_DIR/signing.tpm"
+PUBLIC_KEY="$KEY_DIR/signing.pub"
+ALLOWED_SIGNERS="$HOME/.ssh/allowed_signers"
+AGENT_UNIT="omarchy-tpm-agent.socket"
+AGENT_SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-tpm-agent.sock"
+SIGNING_KEYS=(gpg.format gpg.ssh.program gpg.ssh.allowedsignersfile user.signingkey commit.gpgsign)
+ACCOUNT=$(id -un)
+
+# Absolute, because git resolves gpg.ssh.program through PATH for verification
+# as well as signing, and an early PATH entry would intercept both. Resolved
+# rather than hardcoded, so a checkout on PATH works like a packaged install.
+SIGN_PROGRAM=$(command -v omarchy-ssh-sign || printf '/usr/bin/omarchy-ssh-sign')
+
+green() { printf '\e[32m%s\e[0m\n' "$1"; }
+red() { printf '\e[31m%s\e[0m\n' "$1" >&2; }
+
+escape_hatch() {
+  echo "To stop Git requiring a signature at all:"
+  echo "  git config --global --unset commit.gpgsign"
+}
+
+key_present() { [[ -f $SEALED_KEY && -f $PUBLIC_KEY ]]; }
+key_remnants() { [[ -f $SEALED_KEY || -f $PUBLIC_KEY ]]; }
+fingerprint() { ssh-keygen -lf "$PUBLIC_KEY" 2>/dev/null | awk '{print $2}'; }
+
+# The comment recorded in the key rather than one recomputed from the current
+# hostname, so renaming the machine does not rename the key.
+key_name() {
+  if [[ -f $PUBLIC_KEY ]]; then
+    awk 'NF >= 3 {print $3; exit}' "$PUBLIC_KEY"
+  else
+    printf 'omarchy-signing'
+  fi
+}
+
+# Type and key, which is what identifies it in allowed_signers. Fails rather
+# than returning empty: an empty value would become a pattern matching every
+# line of the trust store.
+key_material() {
+  local material
+  material=$(awk 'NF >= 2 {print $1, $2; exit}' "$PUBLIC_KEY" 2>/dev/null)
+  [[ -n $material ]] || return 1
+  printf '%s' "$material"
+}
+
+# allowed_signers is space-separated and newline-terminated, and its second
+# field is an options list where `cert-authority` is legal. An identity holding
+# whitespace can therefore add a key, or widen trust to every signer -- so only
+# a plain address is accepted.
+valid_identity() {
+  [[ $1 =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+}
+
+tpm_reachable() { ssh-tpm-keygen --supported >/dev/null 2>&1; }
+
+# /dev/tpmrm0 is root:tss, and the group is fixed at login. Omarchy's systemd
+# user manager survives a logout and hands its old group list to the session
+# that follows, so only a reboot makes a fresh grant effective.
+ensure_tpm_access() {
+  tpm_reachable && return 0
+
+  if id -nG "$ACCOUNT" 2>/dev/null | grep -qw tss; then
+    red "This session started before $ACCOUNT was added to the 'tss' group."
+    echo "Reboot, then run this again. Logging out is not enough."
+    return 1
+  fi
+
+  echo "Reaching the TPM needs membership in the 'tss' group. That is full"
+  echo "command access to the chip for good, not just the ability to sign:"
+  echo "anything running as you could then lock the chip or take ownership of"
+  echo "it, and nothing but a firmware reset undoes that. It is not revoked"
+  echo "when this key is removed."
+  gum confirm "Add $ACCOUNT to the 'tss' group?" || return 1
+
+  sudo usermod -aG tss "$ACCOUNT" || return 1
+  echo "Added. Reboot, then run this again."
+  return 1
+}
+
+# `systemctl is-active` reports success for a Type=simple service the moment it
+# forks, and for one whose conditions were unmet. Neither means an agent is
+# listening, so ask the socket instead.
+agent_answers() {
+  SSH_AUTH_SOCK="$AGENT_SOCKET" ssh-add -l >/dev/null 2>&1
+}
+
+start_agent() {
+  systemctl --user daemon-reload >/dev/null 2>&1
+  systemctl --user enable --now "$AGENT_UNIT" >/dev/null 2>&1
+
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    agent_answers && return 0
+    sleep 0.2
+  done
+
+  return 1
+}
+
+# The only check that means anything: ask the chip for a real signature.
+# Prints the signed scratch file so a caller can go on to verify it.
+sign_probe() {
+  local probe
+  probe=$(mktemp) || return 1
+  printf 'omarchy tpm signing check\n' >"$probe"
+
+  if SSH_AUTH_SOCK="$AGENT_SOCKET" \
+    ssh-keygen -Y sign -n git -f "$PUBLIC_KEY" "$probe" >/dev/null 2>&1; then
+    printf '%s' "$probe"
+  else
+    rm -f "$probe"
+    return 1
+  fi
+}
+
+can_sign() {
+  local probe
+  probe=$(sign_probe) || return 1
+  rm -f "$probe" "$probe.sig"
+}
+
+# Signing and verifying are separate failures: the chip can sign a commit that
+# nothing will accept, because the trust store is written by a different step.
+# Proving both here beats finding out at the first commit.
+verify_signing() {
+  local identity="$1" probe status=0
+
+  probe=$(sign_probe) || {
+    red "The chip would not sign. Commits will fail."
+    return 1
+  }
+
+  ssh-keygen -Y verify -f "$ALLOWED_SIGNERS" -I "$identity" -n git \
+    -s "$probe.sig" <"$probe" >/dev/null 2>&1 || status=1
+  rm -f "$probe" "$probe.sig"
+
+  if ((status != 0)); then
+    red "Signed, but the signature does not verify against $ALLOWED_SIGNERS."
+    return 1
+  fi
+
+  green "Checked: signed a test file with the key and verified it."
+}
+
+signing_identity() {
+  local email
+
+  email=$(git config --global user.email)
+  [[ -n $email ]] ||
+    email=$(gum input --prompt "Email for allowed_signers> " --placeholder "you@example.com") ||
+    return 1
+
+  if ! valid_identity "$email"; then
+    red "Not a plain email address: ${email:-<empty>}"
+    red "allowed_signers would read the rest of it as trust options."
+    return 1
+  fi
+
+  printf '%s' "$email"
+}
+
+trust_own_key() {
+  local identity="$1" material
+
+  material=$(key_material) || {
+    red "The public key is empty or malformed; refusing to touch $ALLOWED_SIGNERS."
+    return 1
+  }
+
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh" || return 1
+  touch "$ALLOWED_SIGNERS" || return 1
+
+  if grep -qF -e "$material" -- "$ALLOWED_SIGNERS"; then
+    echo "Key already trusted in $ALLOWED_SIGNERS"
+    return 0
+  fi
+
+  # A file without a trailing newline would otherwise gain a mangled line that
+  # invalidates both it and the entry above it. namespaces="git" keeps the key
+  # trusted for commit signing alone.
+  [[ -s $ALLOWED_SIGNERS && -n $(tail -c1 "$ALLOWED_SIGNERS") ]] &&
+    printf '\n' >>"$ALLOWED_SIGNERS"
+  printf '%s namespaces="git" %s\n' "$identity" "$material" >>"$ALLOWED_SIGNERS" || return 1
+  echo "Trusted the key in $ALLOWED_SIGNERS"
+}
+
+untrust_own_key() {
+  local material status
+
+  material=$(key_material) || return 0
+  [[ -f $ALLOWED_SIGNERS ]] || return 0
+
+  # grep exits 1 when it selects nothing, which is what happens when this key
+  # was the only signer listed -- an empty result, not a failure. Exit 2 is a
+  # real error, and installing its partial output would drop every other signer.
+  local kept
+  kept=$(grep -vF -e "$material" -- "$ALLOWED_SIGNERS")
+  status=$?
+  if ((status > 1)); then
+    red "Could not read $ALLOWED_SIGNERS; left it untouched."
+    return 1
+  fi
+
+  # Written in place rather than renamed over: the file is often a symlink into
+  # a dotfile repo, and replacing it would leave the managed copy still
+  # trusting a key this is removing.
+  printf '%s' "${kept:+$kept$'\n'}" >"$ALLOWED_SIGNERS"
+}
+
+globally_installed() {
+  local program
+  program=$(git config --global gpg.ssh.program)
+  # Any path ending in the wrapper is this command's own doing: a packaged
+  # install, a checkout, or the bare name older versions wrote.
+  [[ $program == */omarchy-ssh-sign || $program == "omarchy-ssh-sign" ]]
+}
+
+configure_globally() {
+  local key
+  for key in "${SIGNING_KEYS[@]}"; do
+    git config --global --unset-all "$key" 2>/dev/null
+  done
+
+  # Checked as a chain: a half-applied configuration that still carries
+  # commit.gpgsign signs every commit with a setup that cannot verify.
+  git config --global gpg.format ssh &&
+    git config --global gpg.ssh.program "$SIGN_PROGRAM" &&
+    git config --global gpg.ssh.allowedsignersfile "$ALLOWED_SIGNERS" &&
+    git config --global user.signingkey "$PUBLIC_KEY" &&
+    git config --global commit.gpgsign true
+}
+
+# What signs commits right now, in words, so the switch is an informed one.
+current_signer() {
+  local program key
+  program=$(git config --global gpg.ssh.program)
+  key=$(git config --global user.signingkey)
+
+  if [[ $(git config --global commit.gpgsign) != "true" ]]; then
+    printf 'nothing -- commits are not signed'
+  elif globally_installed; then
+    printf "this machine's TPM key"
+  elif [[ $program == *op-ssh-sign* ]]; then
+    printf '1Password'
+  elif [[ -n $program ]]; then
+    printf '%s' "$program"
+  elif [[ $(git config --global gpg.format) == "ssh" ]]; then
+    printf 'an SSH key (%.24s...)' "$key"
+  else
+    printf 'GPG'
+  fi
+}
+
+create_key() {
+  if ! omarchy-pkg-add ssh-tpm-agent pinentry || ! omarchy-cmd-present ssh-tpm-keygen; then
+    red "Could not install ssh-tpm-agent, so there is nothing to create a key with."
+    return 1
+  fi
+
+  ensure_tpm_access || return 1
+
+  if key_remnants; then
+    echo "A key already exists: $(key_name)"
+    echo "Replacing it makes the old one permanently unusable."
+    gum confirm "Replace it?" || return 1
+    untrust_own_key
+    rm -f "$SEALED_KEY" "$PUBLIC_KEY"
+  fi
+
+  # Refuse a symlink rather than following it: the key and its 0700 directory
+  # would land wherever it points.
+  [[ -L $KEY_DIR ]] && {
+    red "$KEY_DIR is a symlink; refusing to create a key through it."
+    return 1
+  }
+  mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR" || {
+    red "Could not create $KEY_DIR."
+    return 1
+  }
+
+  echo
+  echo "A PIN is checked by the chip on every single signature, not once per"
+  echo "session, so it means a prompt per commit -- which an agent working"
+  echo "while you are away cannot answer."
+  local want_pin=0
+  gum confirm "Protect the key with a PIN?" --default=false && want_pin=1
+
+  echo "Creating a key inside the TPM..."
+  # ECDSA P-256: TPM 2.0 does not mandate ed25519 and shipped chips do not
+  # implement it. GitHub accepts nistp256 for signing.
+  if ((want_pin)); then
+    # Prompted on this terminal, so the PIN never reaches the process arguments.
+    ssh-tpm-keygen -t ecdsa -b 256 -f "${SEALED_KEY%.tpm}" -C "omarchy-signing" || return 1
+
+    # ssh-tpm-keygen's prompt invites an empty answer and accepts it, so the
+    # key can come back with no PIN while the user believes it has one. The
+    # sealed file records that as an emptyAuth element.
+    if openssl asn1parse -inform PEM -in "$SEALED_KEY" 2>/dev/null |
+      grep -q 'cont \[ 0 \]'; then
+      red "That key was created without a PIN -- the prompt was answered empty."
+      rm -f "$SEALED_KEY" "$PUBLIC_KEY"
+      return 1
+    fi
+  else
+    # `-N ""` looks like "no passphrase" but the empty value is dropped, leaving
+    # ssh-tpm-keygen to prompt: it blocks on a terminal and fails without one.
+    # Answering with nothing is what actually produces a passphraseless key.
+    local empty_askpass
+    empty_askpass=$(mktemp) || return 1
+    printf '#!/bin/bash\necho\n' >"$empty_askpass"
+    chmod 700 "$empty_askpass"
+    SSH_ASKPASS="$empty_askpass" SSH_ASKPASS_REQUIRE=force \
+      ssh-tpm-keygen -t ecdsa -b 256 -f "${SEALED_KEY%.tpm}" -C "omarchy-signing" >/dev/null
+    local created=$?
+    rm -f "$empty_askpass"
+    ((created == 0)) || return 1
+  fi
+
+  chmod 600 "$SEALED_KEY"
+  green "Created $(fingerprint)"
+}
+
+register_at_github() {
+  echo
+  cat "$PUBLIC_KEY"
+  echo
+
+  # The title is world-readable at api.github.com/users/<user>/ssh_signing_keys,
+  # and the public key in a signature can be joined back to it -- so it must not
+  # carry the hostname.
+  echo "Add it as a Signing key only. GitHub's form defaults to Authentication,"
+  echo "and forges with a single key list (GitLab, Gitea, Forgejo) cannot"
+  echo "separate the two -- there, this key would also log you in."
+  gum confirm "Add it to GitHub as a signing key now?" || return 0
+
+  # gh is only tried when it has already been used: the launcher is a lazy mise
+  # stub, and probing an unused one would download the whole CLI. Its own
+  # failure is the scope check, so the error is read rather than pre-empted.
+  if [[ -f $HOME/.config/gh/hosts.yml ]] && omarchy-cmd-present gh &&
+    gh ssh-key add "$PUBLIC_KEY" --type signing --title "$(key_name)" 2>/dev/null; then
+    green "Registered at GitHub."
+    return 0
+  fi
+
+  # GitHub ignores query parameters on this form, so the clipboard is the only
+  # way to hand the key over.
+  wl-copy <"$PUBLIC_KEY" &&
+    echo "Public key copied -- paste it into the form."
+  omarchy-launch-browser "https://github.com/settings/ssh/new"
+  gum confirm "Continue once GitHub has the key?" || return 1
+}
+
+enable_signing() {
+  local identity
+
+  # Already wired up is the case where the check matters most: the setup can
+  # have stopped working since, and nothing else would say so until a commit.
+  if globally_installed; then
+    green "Git already signs through the TPM."
+    identity=$(signing_identity) || return 1
+    verify_signing "$identity"
+    return
+  fi
+
+  echo "Commits are currently signed by: $(current_signer)"
+  gum confirm "Switch to the TPM key, so agents can sign unattended?" || return 0
+
+  identity=$(signing_identity) || return 1
+
+  if ! agent_answers && ! start_agent; then
+    red "The agent is not answering, so signing would fail on every commit."
+    red "Leaving the Git configuration alone."
+    return 1
+  fi
+
+  if ! can_sign; then
+    red "The agent is running but the chip refused to sign."
+    red "The key may have been invalidated by a firmware update or a TPM clear."
+    red "Leaving the Git configuration alone; 'omarchy security signing wipe' starts over."
+    return 1
+  fi
+
+  trust_own_key "$identity" || return 1
+  configure_globally || {
+    red "Could not write the Git configuration; signing is not enabled."
+    return 1
+  }
+
+  verify_signing "$identity" || return 1
+
+  green "All commits on this machine are now signed by the TPM key."
+  echo "GitHub marks them Verified once the key is registered there and the"
+  echo "committer email belongs to your account."
+}
+
+setup_command() {
+  if ! omarchy-hw-tpm; then
+    red "This machine has no TPM 2.0, so there is nothing to seal a key to."
+    return 1
+  fi
+
+  if key_present; then
+    green "Key: $(key_name) ($(fingerprint))"
+  else
+    create_key || return 1
+  fi
+
+  register_at_github || return 1
+  enable_signing
+}
+
+status_command() {
+  omarchy-hw-tpm && green "TPM present" || red "No TPM on this machine"
+
+  if key_present; then
+    green "Key: $(key_name) ($(fingerprint))"
+  else
+    echo "Key: none yet"
+  fi
+
+  if can_sign; then
+    green "Agent: signing works"
+  elif agent_answers; then
+    red "Agent: answering, but the chip refuses to sign"
+  else
+    red "Agent: not answering"
+  fi
+
+  if globally_installed; then
+    green "Git: signing through the TPM"
+  else
+    echo "Git: not signing through the TPM"
+  fi
+
+  # The agent loads every sealed key in the directory, not just this one.
+  local extra
+  extra=$(find "$KEY_DIR" -maxdepth 1 -name '*.tpm' ! -name 'signing.tpm' 2>/dev/null | wc -l)
+  ((extra > 0)) && red "$extra other sealed key(s) in $KEY_DIR are served by the same agent"
+
+  return 0
+}
+
+# Omarchy's other remove commands undo their own change and stop there, which
+# would leave a user who signed through 1Password with nothing. 1Password can
+# name its own keys, so offering the way back costs a prompt.
+offer_1password() {
+  local socket="$HOME/.1password/agent.sock" keys choice
+
+  [[ -x /opt/1Password/op-ssh-sign && -S $socket ]] || return 0
+  keys=$(SSH_AUTH_SOCK="$socket" ssh-add -L 2>/dev/null)
+  [[ -n $keys ]] || return 0
+
+  gum confirm "Point Git back at 1Password for signing?" || return 0
+  choice=$(printf '%s\n' "$keys" | gum choose --header "Which key should sign?") || return 0
+  [[ -n $choice ]] || return 0
+
+  git config --global gpg.format ssh &&
+    git config --global gpg.ssh.program /opt/1Password/op-ssh-sign &&
+    git config --global user.signingkey "$choice" &&
+    git config --global commit.gpgsign true &&
+    green "Git signs through 1Password again."
+}
+
+wipe_command() {
+  if ! key_remnants && ! globally_installed; then
+    echo "Nothing to remove."
+    return 0
+  fi
+
+  echo "This deletes the key. Any copy made from this machine keeps working;"
+  echo "only clearing the TPM in firmware makes every copy useless."
+  gum confirm "Remove the TPM signing key?" || return 0
+
+  untrust_own_key
+
+  if globally_installed; then
+    local key
+    for key in "${SIGNING_KEYS[@]}"; do
+      git config --global --unset-all "$key" 2>/dev/null
+    done
+    offer_1password
+  fi
+
+  rm -rf "$KEY_DIR"
+  systemctl --user disable --now "$AGENT_UNIT" >/dev/null 2>&1
+
+  if id -nG "$ACCOUNT" 2>/dev/null | grep -qw tss &&
+    gum confirm "Also drop $ACCOUNT from the 'tss' group?"; then
+    sudo gpasswd -d "$ACCOUNT" tss >/dev/null && omarchy-state set reboot-required
+    echo "Removed from 'tss'. It takes effect after a reboot."
+  fi
+
+  green "Removed the TPM signing key."
+  echo
+  echo "Any copy of the sealed file taken from this machine still signs: the"
+  echo "file is the whole credential and the chip keeps no record to revoke."
+  echo "Commits already pushed keep their Verified badge too -- GitHub does not"
+  echo "re-check signatures, so removing the key there only stops future ones."
+  echo "Selling this machine? Clear the TPM in the firmware setup to invalidate"
+  echo "every key ever sealed on it, backups included."
+}
+
+case "${1:-setup}" in
+setup) setup_command ;;
+status) status_command ;;
+wipe) wipe_command ;;
+-h | --help)
+  echo "Usage: omarchy security signing [setup|status|wipe]"
+  echo
+  echo "Creates an ECDSA key sealed inside this machine's TPM so commits can be"
+  echo "signed with no passphrase prompt and no key on disk to steal. It is"
+  echo "kept out of GitHub's authentication key list on purpose -- nothing"
+  echo "about the key itself prevents it being used to log in."
+  echo
+  escape_hatch
+  ;;
+*)
+  red "omarchy-security-signing: unknown verb '$1'. Try --help."
+  exit 2
+  ;;
+esac

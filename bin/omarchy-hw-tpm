@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# omarchy:summary=Returns true when a TPM 2.0 resource manager is present
+# omarchy:hidden=true
+
+# The resource manager device rather than /dev/tpm0: every userspace client
+# goes through it, and it is what arbitrates concurrent access. A kernel that
+# exposes only the raw device cannot serve ssh-tpm-agent alongside anything
+# else, so treating that as "no TPM" is the honest answer for the callers here.
+tpm_device="${OMARCHY_TPM_DEVICE:-/dev/tpmrm0}"
+
+[[ -e $tpm_device ]]

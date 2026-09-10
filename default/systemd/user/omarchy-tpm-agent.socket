@@ -1,0 +1,16 @@
+[Unit]
+Description=Socket for the TPM commit signing agent
+Documentation=man:ssh-tpm-agent(1)
+# Inert where there is no chip, so this can be enabled for every user.
+ConditionPathExists=/dev/tpmrm0
+
+[Socket]
+ListenStream=%t/omarchy-tpm-agent.sock
+# Guaranteed rather than inherited: an agent socket is a signing oracle, and
+# self-binding would leave its mode to whatever umask the session happened to
+# have.
+SocketMode=0600
+Service=omarchy-tpm-agent.service
+
+[Install]
+WantedBy=sockets.target

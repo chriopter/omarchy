@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# omarchy:summary=Ask for a TPM key PIN, on a terminal or through pinentry
+# omarchy:hidden=true
+
+# ssh-tpm-agent reads a key's PIN from the terminal when it has one, and
+# otherwise runs whatever SSH_ASKPASS names. The agent runs as a background
+# service, so it never has a terminal and this is the only way a PIN-protected
+# key can be used at all.
+
+set -uo pipefail
+
+prompt="${1:-Enter the PIN for your TPM signing key}"
+
+# A service started at default.target can come up before the graphical session
+# exports its variables to the user manager, which would leave pinentry picking
+# a curses backend with no terminal to draw on. Ask the manager directly.
+session_variable() {
+  local name="$1" value
+
+  value="${!name-}"
+  if [[ -z $value ]]; then
+    value=$(systemctl --user show-environment 2>/dev/null | sed -n "s/^$name=//p" | tail -1)
+  fi
+
+  printf '%s' "$value"
+}
+
+WAYLAND_DISPLAY=$(session_variable WAYLAND_DISPLAY)
+DISPLAY=$(session_variable DISPLAY)
+export WAYLAND_DISPLAY DISPLAY
+
+# Pick the backend rather than letting /usr/bin/pinentry guess: its guess reads
+# the environment this process may have had to reconstruct.
+backends=(curses tty)
+if [[ -n $WAYLAND_DISPLAY || -n $DISPLAY ]]; then
+  backends=(gnome3 gtk qt curses tty)
+fi
+
+pinentry=""
+for backend in "${backends[@]}"; do
+  if omarchy-cmd-present "pinentry-$backend"; then
+    pinentry="pinentry-$backend"
+    break
+  fi
+done
+
+if [[ -z $pinentry ]]; then
+  echo "omarchy-ssh-askpass: no pinentry backend is installed" >&2
+  exit 1
+fi
+
+# Assuan: the answer comes back as a "D <secret>" line, percent-encoded. Only
+# the encodings pinentry actually emits need decoding, and %25 has to go last
+# or it would decode the escapes it introduced.
+secret=$(
+  {
+    printf 'SETTITLE Omarchy commit signing\n'
+    printf 'SETPROMPT PIN:\n'
+    printf 'SETDESC %s\n' "${prompt//$'\n'/ }"
+    printf 'GETPIN\n'
+    printf 'BYE\n'
+  } | "$pinentry" 2>/dev/null | sed -n 's/^D //p'
+)
+
+[[ -n $secret ]] || exit 1
+
+secret=${secret//%0A/$'\n'}
+secret=${secret//%0D/$'\r'}
+secret=${secret//%22/\"}
+secret=${secret//%25/%}
+
+printf '%s\n' "$secret"

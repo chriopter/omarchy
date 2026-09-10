@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# omarchy:summary=Sign with the TPM-sealed key regardless of which agent the shell uses
+# omarchy:hidden=true
+
+# git invokes this as gpg.ssh.program and calls it exactly like ssh-keygen.
+# The only thing added is the socket: signing has to reach the TPM agent, while
+# the shell's own SSH_AUTH_SOCK keeps pointing wherever authentication needs it
+# (1Password, a forwarded agent, the Omarchy relay). Overriding the variable
+# for this one process keeps the two concerns from having to agree.
+export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR:-/run/user/$UID}/omarchy-tpm-agent.sock"
+
+exec /usr/bin/ssh-keygen "$@"
