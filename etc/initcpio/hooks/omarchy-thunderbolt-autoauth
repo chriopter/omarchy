@@ -21,18 +21,24 @@ run_hook() {
   # Let KMS and the Thunderbolt topology settle before authorizing endpoints.
   sleep 2
 
-  for device in "$devices_path"/*; do
-    [ -d "$device" ] || continue
+  # The kernel refuses a device until its parent is authorized, and the glob sorts
+  # 0-103 before its parent 0-3, so repeat until a pass authorizes nothing.
+  while [ "$pending" = "1" ]; do
+    pending=0
 
-    # Skip domains and host routers; only attached devices need authorization.
-    case "${device##*/}" in
-      domain* | *-0) continue ;;
-    esac
+    for device in "$devices_path"/*; do
+      [ -d "$device" ] || continue
 
-    authorized="$device/authorized"
-    [ -w "$authorized" ] || continue
-    [ "$(cat "$authorized" 2>/dev/null)" = "0" ] || continue
+      # Skip domains and host routers; only attached devices need authorization.
+      case "${device##*/}" in
+        domain* | *-0) continue ;;
+      esac
 
-    echo 1 > "$authorized" 2>/dev/null
+      authorized="$device/authorized"
+      [ -w "$authorized" ] || continue
+      [ "$(cat "$authorized" 2>/dev/null)" = "0" ] || continue
+
+      echo 1 > "$authorized" 2>/dev/null && pending=1
+    done
   done
 }

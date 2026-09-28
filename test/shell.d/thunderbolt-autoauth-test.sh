@@ -60,6 +60,28 @@ PATH="$stub_bin:$PATH" TEST_LOG="$sleep_calls" OMARCHY_THUNDERBOLT_DEVICES_PATH=
   fail "runtime hook adds no delay without a pending device" "$(cat "$sleep_calls")"
 pass "runtime hook adds no delay without a pending device"
 
+chain_devices="$test_tmp/chain-devices"
+mkdir -p "$chain_devices/0-0" "$chain_devices/0-3" "$chain_devices/0-103"
+printf '1\n' > "$chain_devices/0-0/authorized"
+printf '0\n' > "$chain_devices/0-3/authorized"
+printf '0\n' > "$chain_devices/0-103/authorized"
+PATH="$stub_bin:$PATH" TEST_LOG="$test_tmp/chain-sleep.log" OMARCHY_THUNDERBOLT_DEVICES_PATH="$chain_devices" \
+  bash -c '
+    # Like the kernel, refuse 0-103 until its parent 0-3 is authorized; the glob visits 0-103 first.
+    echo() {
+      if [[ $(readlink "/proc/$$/fd/1") == */0-103/authorized && $(<"$OMARCHY_THUNDERBOLT_DEVICES_PATH/0-3/authorized") != "1" ]]; then
+        builtin echo 0
+        return 1
+      fi
+      builtin echo "$@"
+    }
+    source "$1"
+    run_hook
+  ' -- "$runtime_hook"
+[[ $(<"$chain_devices/0-3/authorized") == "1" && $(<"$chain_devices/0-103/authorized") == "1" ]] ||
+  fail "runtime hook authorizes a device behind one that sorts after it"
+pass "runtime hook authorizes a device behind one that sorts after it"
+
 calls="$test_tmp/calls.log"
 marker="$test_tmp/rebuild-complete"
 : > "$calls"
