@@ -5,20 +5,26 @@ set -euo pipefail
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 
 hooks_conf="$ROOT/etc/mkinitcpio.conf.d/omarchy_hooks.conf"
-install_hook="$ROOT/etc/initcpio/install/thunderbolt_autoauth"
-runtime_hook="$ROOT/etc/initcpio/hooks/thunderbolt_autoauth"
+install_hook="$ROOT/etc/initcpio/install/omarchy-thunderbolt-autoauth"
+runtime_hook="$ROOT/etc/initcpio/hooks/omarchy-thunderbolt-autoauth"
 migration="$ROOT/migrations/1786961462.sh"
 
 resolved_hooks=$(bash -uc "MODULES=(); FILES=(); XKBLAYOUT=us; source '$hooks_conf'; echo \"\${HOOKS[*]}\"")
-[[ $resolved_hooks == *" block thunderbolt_autoauth encrypt "* ]] ||
+[[ $resolved_hooks == *" block omarchy-thunderbolt-autoauth encrypt "* ]] ||
   fail "Thunderbolt authorization runs immediately before encrypt" "actual: $resolved_hooks"
-(( $(grep -o 'thunderbolt_autoauth' <<<"$resolved_hooks" | wc -l) == 1 )) ||
+(( $(grep -o 'omarchy-thunderbolt-autoauth' <<<"$resolved_hooks" | wc -l) == 1 )) ||
   fail "Thunderbolt authorization appears once in HOOKS" "actual: $resolved_hooks"
 pass "Thunderbolt authorization runs once immediately before encrypt"
 
 [[ $(bash -c 'add_runscript() { echo added; }; source "$1"; build' -- "$install_hook") == "added" ]] ||
   fail "Thunderbolt install hook adds its runtime script"
 pass "Thunderbolt install hook adds its runtime script"
+
+# A hook a user copied into /etc/initcpio by hand is unowned, so shipping the same path aborts the upgrade.
+for hook in "$ROOT"/etc/initcpio/{hooks,install}/*; do
+  [[ ${hook##*/} == omarchy-* ]] || fail "packaged initcpio hooks carry the omarchy- prefix" "actual: ${hook#"$ROOT"/}"
+done
+pass "packaged initcpio hooks carry the omarchy- prefix"
 
 test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' EXIT
