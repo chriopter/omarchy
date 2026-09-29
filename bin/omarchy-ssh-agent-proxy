@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# omarchy:summary=Relay an SSH agent connection to the newest forwarded agent, or a local one
+# omarchy:summary=Relay an SSH agent connection to the agent of whoever is at the keyboard
 # omarchy:hidden=true
 
 # systemd starts this for every connection to $XDG_RUNTIME_DIR/omarchy-ssh-agent.sock
@@ -8,12 +8,22 @@
 # connection. A shell that never had an agent -- Herdr panes inherit the Herdr
 # server's environment, not the SSH session's -- points SSH_AUTH_SOCK at that
 # socket, and every request is relayed to the best agent at that moment instead
-# of the one that happened to exist when the shell started:
+# of the one that happened to exist when the shell started.
 #
-#   1. the newest agent sshd forwarded into ~/.ssh/agent/ that answers
-#   2. else the newest one that only timed out -- a forwarded 1Password waiting
-#      on its unlock prompt looks like that, and is still the right agent
-#   3. else an agent running on this machine (1Password, gnome-keyring, ssh-agent)
+# The best agent is the one belonging to where the user is sitting, since that
+# is where 1Password shows its approval prompt:
+#
+#   - someone is using this machine's unlocked desktop right now: an agent
+#     running here (1Password, gnome-keyring, ssh-agent), then forwarded ones
+#   - otherwise: the newest agent sshd forwarded into ~/.ssh/agent/, then the
+#     local ones
+#
+# Within each group an agent that answers beats one that only timed out -- a
+# 1Password waiting on its unlock prompt looks like that, and is still the right
+# agent -- and the first group wins over the second whenever it has either.
+#
+# OMARCHY_SSH_AGENT_PROXY_DEBUG=1 logs the choice to stderr (the journal).
+# OMARCHY_SSH_AGENT_PROXY_PRESENCE=local|away skips the desktop check.
 
 set -uo pipefail
 
@@ -25,6 +35,17 @@ local_agents=(
   "$runtime_dir/ssh-agent.socket"
 )
 probe_timeout=3
+# Typing into a terminal on this desktop within this many seconds counts as
+# being here when nothing else says whether the desktop is idle.
+presence_window=120
+# Terminal hosts whose panes take input from remote clients too, so input read
+# by one of their ptys says nothing about who is at this keyboard.
+shared_pty_hosts="herdr tmux zellij screen SCREEN sshd sshd-session mosh-server abduco dtach"
+
+debug() {
+  [[ ${OMARCHY_SSH_AGENT_PROXY_DEBUG:-} == 1 ]] && echo "omarchy-ssh-agent-proxy: $*" >&2
+  return 0
+}
 
 # 0 = answers, 1 = timed out, 2 = dead. ssh-add exits 1 both for "no
 # identities" and for a connection the far side dropped, so read the message
@@ -43,32 +64,152 @@ probe() {
   esac
 }
 
-# Newest first: the latest login is the one whose owner is sitting at a
+# Newest first: the latest login is the one whose owner is most likely at a
 # keyboard right now.
 forwarded_agents() {
   find "$forwarded_dir" -maxdepth 1 -type s -name 's.*' -printf '%T@ %p\n' 2>/dev/null |
     sort -rn | cut -d' ' -f2-
 }
 
-target=""
-slow=""
-while IFS= read -r socket; do
-  [[ -S $socket ]] || continue
-  probe "$socket"
-  case $? in
-    0)
-      target=$socket
-      break
-      ;;
-    1) [[ -n $slow ]] || slow=$socket ;;
-  esac
-done < <(forwarded_agents; printf '%s\n' "${local_agents[@]}")
+# The ptys of terminals open on this desktop: the controlling tty of every
+# session leader whose parent -- the terminal emulator -- belongs to this user
+# and is neither a multiplexer (its panes read the input of every attached
+# client alike) nor part of another login session (sshd). Reads only
+# /proc/PID/stat and /proc/PID/cgroup, which the unit's sandbox (its own user
+# namespace) can still see; /proc/PID/fd it cannot.
+local_terminal_ptys() {
+  local session="$1"
 
-[[ -n $target ]] || target=$slow
+  awk -v uid="$UID" -v session="$session" -v shared="$shared_pty_hosts" '
+    BEGIN { n = split(shared, list, " "); for (i = 1; i <= n; i++) skip[list[i]] = 1 }
+    FNR == 1 {
+      line = $0
+      open = index(line, "("); shut = 0
+      for (i = length(line); i > open; i--) if (substr(line, i, 1) == ")") { shut = i; break }
+      if (!open || !shut) next
+      pid = substr(line, 1, open - 2) + 0
+      comm[pid] = substr(line, open + 1, shut - open - 1)
+      split(substr(line, shut + 2), f, " ")
+      ppid[pid] = f[2]; sid[pid] = f[4]; tty[pid] = f[5]
+      nextfile
+    }
+    END {
+      for (pid in tty) {
+        if (pid != sid[pid] || tty[pid] <= 0) continue
+        major = int(tty[pid] / 256) % 4096
+        minor = tty[pid] % 256 + int(tty[pid] / 1048576) * 256
+        if (major < 136 || major > 143) continue
+        parent = ppid[pid]
+        if (!(parent in comm) || comm[parent] in skip || comm[parent] ~ /^tmux/) continue
+        file = "/proc/" parent "/cgroup"; cgroup = ""
+        while ((getline part < file) > 0) cgroup = cgroup part
+        close(file)
+        if (cgroup !~ "/user-" uid "\\.slice/") continue
+        if (cgroup ~ /\/session-[^\/]*\.scope/ && cgroup !~ "/session-" session "\\.scope") continue
+        print "/dev/pts/" ((major - 136) * 256 + minor)
+      }
+    }
+  ' /proc/[0-9]*/stat 2>/dev/null | sort -u
+}
+
+# Seconds since a terminal on this desktop last read input: the tty atime `w`
+# reports as IDLE, which the kernel updates at most every 8 s.
+local_terminal_idle() {
+  local newest=0 atime
+  local -a ptys
+
+  mapfile -t ptys < <(local_terminal_ptys "$1")
+  ((${#ptys[@]})) || return 1
+  while IFS= read -r atime; do
+    ((atime > newest)) && newest=$atime
+  done < <(stat -c %X "${ptys[@]}" 2>/dev/null)
+  ((newest > 0)) || return 1
+  echo $(($(date +%s) - newest))
+}
+
+# Is someone sitting at this machine's desktop right now? Needs the user's
+# graphical session to be the active one on its seat and unlocked, and some
+# sign of recent input: logind's idle hint when the desktop maintains it, else
+# the Omarchy shell's idle monitor, else typing into a local terminal (the idle
+# monitor is off while Stay Awake is on).
+local_user_present() {
+  local session props status idle
+
+  case ${OMARCHY_SSH_AGENT_PROXY_PRESENCE:-} in
+    local) return 0 ;;
+    away) return 1 ;;
+  esac
+
+  session=$(timeout 2 loginctl show-user "$UID" -p Display --value 2>/dev/null)
+  [[ -n $session ]] || { debug "no graphical session"; return 1; }
+  props=$(timeout 2 loginctl show-session "$session" -p Active -p Remote -p LockedHint -p IdleHint -p IdleSinceHint 2>/dev/null)
+  [[ $props == *"Active=yes"* && $props == *"Remote=no"* ]] || { debug "session $session not active"; return 1; }
+  [[ $props == *"LockedHint=yes"* ]] && { debug "session $session locked"; return 1; }
+
+  if command -v omarchy-shell >/dev/null; then
+    [[ $(OMARCHY_SHELL_IPC_TIMEOUT=1s omarchy-shell lock isLocked 2>/dev/null) == true ]] &&
+      { debug "omarchy shell locked"; return 1; }
+  fi
+
+  if [[ $props != *"IdleSinceHint=0"* ]]; then
+    [[ $props == *"IdleHint=no"* ]] && { debug "logind: not idle"; return 0; }
+    debug "logind: idle"
+    return 1
+  fi
+
+  if command -v omarchy-shell >/dev/null; then
+    status=$(OMARCHY_SHELL_IPC_TIMEOUT=1s omarchy-shell idle status 2>/dev/null)
+    if [[ $status == *'"enabled":true'* ]]; then
+      [[ $status == *'"idle":false'* ]] && { debug "omarchy shell: not idle"; return 0; }
+      debug "omarchy shell: idle"
+      return 1
+    fi
+  fi
+
+  idle=$(local_terminal_idle "$session") || { debug "no local terminal"; return 1; }
+  debug "local terminal input ${idle}s ago"
+  ((idle <= presence_window))
+}
+
+# Pick the first agent that answers from the listed sockets, else the first
+# that only timed out. Returns 1 when none of them is usable.
+pick() {
+  local socket slow=""
+
+  for socket in "$@"; do
+    [[ -S $socket ]] || continue
+    probe "$socket"
+    case $? in
+      0)
+        echo "$socket"
+        return 0
+        ;;
+      1) [[ -n $slow ]] || slow=$socket ;;
+    esac
+  done
+
+  [[ -n $slow ]] && echo "$slow"
+}
+
+mapfile -t forwarded < <(forwarded_agents)
+
+if ((${#forwarded[@]})) && ! local_user_present; then
+  first=("${forwarded[@]}")
+  second=("${local_agents[@]}")
+  debug "preferring forwarded agents"
+else
+  first=("${local_agents[@]}")
+  second=("${forwarded[@]}")
+  debug "preferring local agents"
+fi
+
+target=$(pick "${first[@]}")
+[[ -n $target ]] || target=$(pick "${second[@]}")
 
 if [[ -z $target ]]; then
   echo "omarchy-ssh-agent-proxy: no SSH agent is reachable" >&2
   exit 1
 fi
 
+debug "relaying to $target"
 exec socat STDIO "UNIX-CONNECT:$target"

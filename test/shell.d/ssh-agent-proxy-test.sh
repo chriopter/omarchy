@@ -26,6 +26,10 @@ mkdir -p "$HOME/.ssh/agent" "$HOME/.1password" "$XDG_RUNTIME_DIR"
 
 proxy="$XDG_RUNTIME_DIR/omarchy-ssh-agent.sock"
 
+# Whether someone is at this desktop decides the order; pin it instead of
+# asking the machine running the tests.
+export OMARCHY_SSH_AGENT_PROXY_PRESENCE=away
+
 # A real ssh-agent on the given socket, holding one key whose comment names it,
 # so listing through the relay says which agent answered.
 start_agent() {
@@ -50,7 +54,7 @@ dead_socket() {
 }
 
 listed_through_proxy() {
-  SSH_AUTH_SOCK=$proxy timeout 20 ssh-add -l 2>&1 || true
+  SSH_AUTH_SOCK=${1:-$proxy} timeout 20 ssh-add -l 2>&1 || true
 }
 
 start_agent "$HOME/.ssh/agent/s.a.sshd.older" older
@@ -58,13 +62,18 @@ start_agent "$HOME/.ssh/agent/s.b.sshd.newer" newer
 start_agent "$HOME/.1password/agent.sock" local
 touch -d '-2 minutes' "$HOME/.ssh/agent/s.a.sshd.older"
 
+# A second relay that sees someone at the desktop.
+proxy_here="$WORKDIR/here.sock"
 socat UNIX-LISTEN:"$proxy",fork,mode=600 EXEC:"$ROOT/bin/omarchy-ssh-agent-proxy" 2>/dev/null &
 PIDS+=($!)
+OMARCHY_SSH_AGENT_PROXY_PRESENCE=local \
+  socat UNIX-LISTEN:"$proxy_here",fork,mode=600 EXEC:"$ROOT/bin/omarchy-ssh-agent-proxy" 2>/dev/null &
+PIDS+=($!)
 for _ in {1..50}; do
-  [[ -S $proxy ]] && break
+  [[ -S $proxy && -S $proxy_here ]] && break
   sleep 0.1
 done
-[[ -S $proxy ]] || fail "relay socket comes up"
+[[ -S $proxy && -S $proxy_here ]] || fail "relay socket comes up"
 
 output=$(listed_through_proxy)
 [[ $output == *" newer "* && $output != *" older "* ]] ||
@@ -75,6 +84,18 @@ dead_socket "$HOME/.ssh/agent/s.c.sshd.dead"
 output=$(listed_through_proxy)
 [[ $output == *" newer "* ]] || fail "relay skips a forwarded socket nobody answers" "$output"
 pass "relay skips a forwarded socket nobody answers"
+
+output=$(listed_through_proxy "$proxy_here")
+[[ $output == *" local "* && $output != *" newer "* ]] ||
+  fail "relay prefers the local agent while someone is at the desktop" "$output"
+pass "relay prefers the local agent while someone is at the desktop"
+
+mv "$HOME/.1password/agent.sock" "$WORKDIR/local.sock"
+output=$(listed_through_proxy "$proxy_here")
+[[ $output == *" newer "* ]] ||
+  fail "relay falls back to a forwarded agent when the desktop has none" "$output"
+pass "relay falls back to a forwarded agent when the desktop has none"
+mv "$WORKDIR/local.sock" "$HOME/.1password/agent.sock"
 
 rm "$HOME/.ssh/agent/s.a.sshd.older" "$HOME/.ssh/agent/s.b.sshd.newer" "$HOME/.ssh/agent/s.c.sshd.dead"
 output=$(listed_through_proxy)
