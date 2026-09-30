@@ -79,6 +79,12 @@ Item {
     if (root.opened) root.rebuildDisplay()
   }
 
+  // The reload on open finishes after the first rebuild; refresh once it lands.
+  function loadUsage(raw) {
+    root.usage = EmojiSearch.parseUsage(raw)
+    if (root.opened) root.rebuildDisplay()
+  }
+
   function rebuildDisplay() {
     var out = EmojiSearch.filterEmojis(root.emojis, root.filterText, 1000)
     root.filteredEmojis = out
@@ -171,11 +177,10 @@ Item {
   FileView {
     id: usageFile
     path: Quickshell.env("HOME") + "/.local/state/omarchy/emoji-usage.json"
-    blockLoading: true
     atomicWrites: true
     printErrors: false
-    onLoaded: root.usage = EmojiSearch.parseUsage(text())
-    onLoadFailed: root.usage = {}
+    onLoaded: root.loadUsage(text())
+    onLoadFailed: root.loadUsage("")
   }
 
   FileView {

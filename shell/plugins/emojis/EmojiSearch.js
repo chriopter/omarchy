@@ -7,14 +7,19 @@ function parseEmojis(raw) {
   }
 }
 
-// Use counts keyed by emoji, e.g. { "👍": 12 }.
+// Use counts keyed by emoji, e.g. { "👍": 12 }. Hand edits may be wrong, so
+// only positive numeric counts are kept.
 function parseUsage(raw) {
+  var usage = {}
   try {
     var data = JSON.parse(String(raw || ""))
-    return data && typeof data === "object" && !Array.isArray(data) ? data : {}
-  } catch (e) {
-    return {}
-  }
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      for (var key in data) {
+        if (typeof data[key] === "number" && data[key] > 0) usage[key] = data[key]
+      }
+    }
+  } catch (e) {}
+  return usage
 }
 
 function normalizedQuery(query) {
@@ -48,11 +53,15 @@ function filterEmojis(emojis, query, limit) {
 }
 
 // Emojis ranked by use count, topped up from the catalog so the rows stay full.
+// Only emojis from the catalog count, so a mistyped key never takes a cell.
 function mostUsed(emojis, counts, count) {
-  var top = Object.keys(counts).sort(function(a, b) { return counts[b] - counts[a] }).slice(0, Math.max(0, count))
-  var values = Array.isArray(emojis) ? emojis : []
-  for (var i = 0; top.length < count && i < values.length; i++) {
-    if (values[i] && values[i].e && top.indexOf(values[i].e) < 0) top.push(values[i].e)
+  var catalog = (Array.isArray(emojis) ? emojis : []).map(function(item) { return item && item.e })
+  var top = Object.keys(counts)
+    .filter(function(emoji) { return catalog.indexOf(emoji) >= 0 })
+    .sort(function(a, b) { return counts[b] - counts[a] })
+    .slice(0, Math.max(0, count))
+  for (var i = 0; top.length < count && i < catalog.length; i++) {
+    if (catalog[i] && top.indexOf(catalog[i]) < 0) top.push(catalog[i])
   }
   return top
 }
