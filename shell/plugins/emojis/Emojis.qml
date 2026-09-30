@@ -90,9 +90,10 @@ Item {
     root.filteredEmojis = out
 
     displayModel.clear()
-    if (!root.filterText && Object.keys(root.usage).length > 0) {
+    var frequent = root.filterText ? [] : EmojiSearch.mostUsed(root.emojis, root.usage, root.columns * root.topRows)
+    if (frequent.length > 0) {
       root.appendHeading("Frequent")
-      root.appendEmojis(EmojiSearch.mostUsed(root.emojis, root.usage, root.columns * root.topRows))
+      root.appendEmojis(frequent)
       root.appendHeading("All")
     }
     root.appendEmojis(out.map(function(item) { return item.e }))

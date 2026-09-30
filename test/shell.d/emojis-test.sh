@@ -62,6 +62,12 @@ assertDeepEqual(
   'most used emojis ignore keys outside the catalog'
 )
 
+assertDeepEqual(
+  emojis.mostUsed(fixture, { typo: 9 }, 3),
+  [],
+  'most used emojis stay empty without a counted catalog emoji'
+)
+
 assertEqual(
   emojis.filterEmojis(data, 'face with tears')[0].e,
   '\u{1F602}',
