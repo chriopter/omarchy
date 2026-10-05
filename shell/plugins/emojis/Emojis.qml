@@ -92,7 +92,6 @@ Item {
     displayModel.clear()
     var frequent = root.filterText ? [] : EmojiSearch.mostUsed(root.emojis, root.usage, root.columns * root.topRows)
     if (frequent.length > 0) {
-      root.appendHeading("Frequent")
       root.appendEmojis(frequent)
       root.appendHeading("All")
     }
@@ -125,13 +124,12 @@ Item {
   function moveTo(index, step) {
     if (displayModel.count === 0) return
     index = Math.max(0, Math.min(displayModel.count - 1, index))
-    // Overshooting the top lands on the heading; settle on the first emoji.
+    // Nothing past the heading in that direction; settle on the emoji after it.
     var next = skipHeadings(index, step)
     index = next >= 0 ? next : skipHeadings(index, 1)
     cursorActive = true
     selectedIndex = index
-    // Near the top, reveal the heading above the first row.
-    resultGrid.positionViewAtIndex(index < columns * 2 ? 0 : index, GridView.Contain)
+    resultGrid.positionViewAtIndex(index, GridView.Contain)
   }
 
   function select(delta) {
