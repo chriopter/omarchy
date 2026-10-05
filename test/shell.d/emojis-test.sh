@@ -63,9 +63,15 @@ assertDeepEqual(
 )
 
 assertDeepEqual(
-  emojis.mostUsed(fixture, { typo: 9 }, 3),
-  [],
-  'most used emojis stay empty without a counted catalog emoji'
+  emojis.mostUsed(data, {}, 3),
+  ['\u{1F602}', '\u{2764}\u{FE0F}', '\u{1F60D}'],
+  'most used emojis start out with the popular ones'
+)
+
+assertDeepEqual(
+  emojis.mostUsed(data, { '\u{1F60D}': 1 }, 3),
+  ['\u{1F60D}', '\u{1F602}', '\u{2764}\u{FE0F}'],
+  'most used emojis rank picks ahead of the popular ones'
 )
 
 assertEqual(

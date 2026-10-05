@@ -52,18 +52,27 @@ function filterEmojis(emojis, query, limit) {
   return out
 }
 
-// Emojis ranked by use count, topped up from the catalog so the rows stay full.
-// Only emojis from the catalog count, so a mistyped key never takes a cell.
-// Nothing picked yet means no section at all, rather than rows of filler.
+// What the world picks most, most used first (Unicode Consortium emoji
+// frequency), so the top rows are useful before anything has been picked.
+var popularEmojis = [
+  "😂", "❤️", "😍", "🤣", "😊", "🙏", "💕", "😭", "😘", "👍",
+  "😅", "👏", "😁", "♥️", "🔥", "💔", "💖", "💙", "😢", "🤔",
+  "😆", "🙄", "💪", "😉", "☺️", "👌", "🤗", "💜", "😔", "😎",
+  "😇", "🌹", "🤦", "🎉", "‼️", "💞", "✌️", "✨", "🤷", "😱"
+]
+
+// Emojis ranked by use count, topped up with the popular ones and then the
+// catalog so the rows stay full. Only emojis from the catalog count, so a
+// mistyped key never takes a cell.
 function mostUsed(emojis, counts, count) {
   var catalog = (Array.isArray(emojis) ? emojis : []).map(function(item) { return item && item.e })
   var top = Object.keys(counts)
     .filter(function(emoji) { return catalog.indexOf(emoji) >= 0 })
     .sort(function(a, b) { return counts[b] - counts[a] })
     .slice(0, Math.max(0, count))
-  if (top.length === 0) return top
-  for (var i = 0; top.length < count && i < catalog.length; i++) {
-    if (catalog[i] && top.indexOf(catalog[i]) < 0) top.push(catalog[i])
+  var fill = popularEmojis.filter(function(emoji) { return catalog.indexOf(emoji) >= 0 }).concat(catalog)
+  for (var i = 0; top.length < count && i < fill.length; i++) {
+    if (fill[i] && top.indexOf(fill[i]) < 0) top.push(fill[i])
   }
   return top
 }
